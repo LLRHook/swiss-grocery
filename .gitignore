@@ -1,0 +1,30 @@
+# Go
+services/api/tmp/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+services/scraper/.env
+
+# Expo / React Native
+apps/mobile/node_modules/
+apps/mobile/.expo/
+apps/mobile/dist/
+apps/mobile/ios/
+apps/mobile/android/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+*.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
