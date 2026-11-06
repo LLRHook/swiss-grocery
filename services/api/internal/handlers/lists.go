@@ -1,12 +1,13 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
-	"math"
 
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/LLRHook/swiss-grocery/services/api/internal/models"
+	"github.com/LLRHook/swiss-grocery/services/api/internal/optimizer"
 )
 
 type ListHandler struct {
@@ -117,12 +118,15 @@ func (h *ListHandler) RemoveItem(c fiber.Ctx) error {
 	return c.JSON(fiber.Map{"deleted": true})
 }
 
-// Optimize finds the cheapest store allocation for list items
+// Optimize loads offers and delegates allocation and calculations to Rust.
 func (h *ListHandler) Optimize(c fiber.Ctx) error {
 	listID := c.Params("id")
+	ctx, cancel := context.WithTimeout(c.Context(), optimizer.Timeout)
+	defer cancel()
 
-	// Get all items that have a linked product
-	rows, err := h.db.Query(
+	// Keep SQL row order: equal-price selections retain their first row.
+	rows, err := h.db.QueryContext(
+		ctx,
 		`SELECT sli.name, sli.product_id, s.id, s.name, s.slug, sp.current_price, sp.currency
 		 FROM shopping_list_items sli
 		 JOIN store_products sp ON sp.product_id = sli.product_id
@@ -136,72 +140,28 @@ func (h *ListHandler) Optimize(c fiber.Ctx) error {
 	}
 	defer rows.Close()
 
-	// Group: for each item, find cheapest store
-	type itemPrice struct {
-		itemName string
-		storeID  int
-		store    models.Store
-		price    float64
-		currency string
-	}
-
-	bestPrices := map[string]itemPrice{} // keyed by item name
-	var worstTotal float64
-	worstPrices := map[string]float64{}
-
+	var batch optimizer.Batch
 	for rows.Next() {
-		var ip itemPrice
+		var row optimizer.Candidate
 		var productID int
-		if err := rows.Scan(&ip.itemName, &productID, &ip.store.ID, &ip.store.Name, &ip.store.Slug, &ip.price, &ip.currency); err != nil {
-			continue
+		var currency string
+		if err := rows.Scan(&row.Name, &productID, &row.Store.ID, &row.Store.Name, &row.Store.Slug, &row.Price, &currency); err != nil {
+			continue // Preserve the existing scan-error policy.
 		}
-
-		// Track worst price per item for savings calc
-		if existing, ok := worstPrices[ip.itemName]; !ok || ip.price > existing {
-			worstPrices[ip.itemName] = ip.price
-		}
-
-		// Keep cheapest per item
-		if existing, ok := bestPrices[ip.itemName]; !ok || ip.price < existing.price {
-			bestPrices[ip.itemName] = ip
+		if err := batch.Add(row); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "failed to optimize"})
 		}
 	}
-
-	// Build store plans
-	storePlans := map[int]*models.StorePlan{}
-	var totalCost float64
-
-	for _, bp := range bestPrices {
-		if _, ok := storePlans[bp.storeID]; !ok {
-			storePlans[bp.storeID] = &models.StorePlan{
-				Store: bp.store,
-				Items: []models.OptimizedItem{},
-			}
-		}
-		storePlans[bp.storeID].Items = append(storePlans[bp.storeID].Items, models.OptimizedItem{
-			Name:  bp.itemName,
-			Price: bp.price,
-		})
-		storePlans[bp.storeID].Subtotal += bp.price
-		totalCost += bp.price
+	if err := rows.Err(); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "failed to optimize"})
 	}
-
-	for _, wp := range worstPrices {
-		worstTotal += wp
+	// Release SQL resources before starting the single native batch process.
+	if err := rows.Close(); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "failed to optimize"})
 	}
-
-	plans := []models.StorePlan{}
-	for _, sp := range storePlans {
-		sp.Subtotal = math.Round(sp.Subtotal*100) / 100
-		plans = append(plans, *sp)
+	result, err := batch.Optimize(ctx)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "failed to optimize"})
 	}
-
-	result := models.OptimizedPlan{
-		TotalCost:  math.Round(totalCost*100) / 100,
-		Currency:   "CHF",
-		Savings:    math.Round((worstTotal-totalCost)*100) / 100,
-		StorePlans: plans,
-	}
-
 	return c.JSON(result)
 }
