@@ -1,5 +1,7 @@
 # Go
 services/api/tmp/
+.build/
+services/api/optimizer/target/
 
 # Python
 __pycache__/
